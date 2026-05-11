@@ -1,5 +1,6 @@
 import { StrictMode, useSyncExternalStore } from "react";
 import { createRoot } from "react-dom/client";
+import { Analytics } from "@vercel/analytics/react";
 import CadWorkspace from "./components/CadWorkspace";
 import faviconUrl from "./app/favicon.png";
 import "./app/globals.css";
@@ -43,6 +44,7 @@ function bootstrap() {
   root.render(
     <StrictMode>
       <AppRoot />
+      <Analytics />
     </StrictMode>,
   );
 }
