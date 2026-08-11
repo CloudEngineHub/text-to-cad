@@ -1,2 +1,2 @@
---editable ./scripts/packages/cadpy
+cadgen==0.4.1
 playwright
