@@ -374,15 +374,63 @@ jobs:
         if: steps.gate.outputs.should_publish == 'true'
         run: scripts/test/test.sh
 
+      # cadgen is built and uploaded from packages/, which the trim below
+      # removes, and BEFORE the target-branch push: a failed upload must block
+      # the release, because the publish tree pins cadgen==<version> from PyPI
+      # and a main without the matching PyPI release would break skill installs.
+      # Uploading before the pin also means the pin can only ever name a version
+      # that already exists. If PyPI succeeds but a later step fails, rerun
+      # Release with bump=none; skip-existing makes the re-upload a no-op.
+      #
+      # Only the upload itself is gated on main. The version check and the build
+      # run for build-test too, so a rehearsal exercises everything about this
+      # that can be exercised without publishing.
+      - name: Check cadgen package version matches the canonical release version
+        if: steps.gate.outputs.should_publish == 'true'
+        run: |
+          version="$(tr -d '[:space:]' < VERSION)"
+          if ! grep -Eq "^version = \"$version\"$" packages/cadgen/pyproject.toml; then
+            echo "packages/cadgen/pyproject.toml version does not match VERSION ($version)." >&2
+            exit 1
+          fi
+
+      - name: Build cadgen sdist and wheel
+        if: steps.gate.outputs.should_publish == 'true'
+        run: |
+          python3 -m pip install --upgrade build
+          python3 -m build packages/cadgen
+
+      - name: Publish cadgen to PyPI
+        if: ${{ steps.gate.outputs.should_publish == 'true' && inputs.target_branch == 'main' }}
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: packages/cadgen/dist
+          skip-existing: true
+
       # The plugin package is the repository root, so everything that reaches the
-      # target branch is copied into every install. models/ is fixture data;
-      # viewer/ is the SOURCE app, and what installs and runs is the dereferenced
-      # runtime the bundle already wrote to skills/cad-viewer/scripts/viewer --
-      # no skill imports repo-root viewer/. This runs after the bundle,
-      # check-builds, and the tests, so the tree they validated is untouched and
-      # only the published tree is trimmed. The standalone cad-viewer mirror
-      # syncs from the release SOURCE commit rather than from here
-      # (.github/workflows/sync-cad-viewer.yml).
+      # target branch is copied into every install. None of these is part of what
+      # installs:
+      #   models/            fixture data
+      #   viewer/            the SOURCE app -- what runs is the dereferenced
+      #                      runtime the bundle wrote to
+      #                      skills/cad-viewer/scripts/viewer, and no skill
+      #                      imports repo-root viewer/
+      #   tests/             source-only; nothing under skills/ or docs/ reads it,
+      #                      and test.yml runs on develop, never here
+      #   requirements-dev.txt  a source-checkout dev environment whose editable
+      #                      paths (packages/cadgen, viewer/moveit2_server) do not
+      #                      survive the trim anyway
+      #   docs/              a website, not an install; Deploy Docs builds and
+      #                      deploys it from the release SOURCE commit
+      #   packages/          the shared source runtimes. Every skill already
+      #                      carries its own vendored copy, and the only other
+      #                      consumer was the docs build, which now runs from
+      #                      source too.
+      #
+      # This runs after the bundle, check-builds, and the tests, so the tree they
+      # validated is untouched and only the published tree is trimmed. The
+      # standalone cad-viewer mirror syncs from the release SOURCE commit rather
+      # than from here (.github/workflows/sync-cad-viewer.yml).
       #
       # PUBLISH_TREE_REMOVED_ROOTS is the single source of truth for what was
       # dropped: the commit step below reads it both to assert the roots are
@@ -390,7 +438,7 @@ jobs:
       - name: Trim publish tree
         if: steps.gate.outputs.should_publish == 'true'
         run: |
-          removed_roots="models viewer"
+          removed_roots="models viewer tests requirements-dev.txt docs packages"
           for root in $removed_roots; do
             rm -rf "$root"
             if [ -e "$root" ]; then
@@ -401,6 +449,20 @@ jobs:
           if [ ! -f skills/cad-viewer/scripts/viewer/package.json ]; then
             echo "Refusing to publish without the bundled CAD Viewer runtime:" >&2
             echo "  skills/cad-viewer/scripts/viewer/package.json is missing." >&2
+            exit 1
+          fi
+          # Every skill vendors what it needs, so no skill SOURCE may reach
+          # repo-root packages/ -- one that does would break silently on install
+          # rather than here. Generated artifacts are exempt: a bundled dist/ is
+          # self-contained, and its sourcemaps name the original source paths as
+          # debug metadata, which is not a runtime reference.
+          skill_packages_refs() {
+            grep -rIlE '\.\./\.\./\.\./packages/|["'"'"']\.\./\.\./packages/' skills \
+              --exclude='*.map' --exclude-dir=dist 2>/dev/null || true
+          }
+          if [ -n "$(skill_packages_refs)" ]; then
+            echo "A skill references repo-root packages/, which is not published:" >&2
+            skill_packages_refs >&2
             exit 1
           fi
           echo "PUBLISH_TREE_REMOVED_ROOTS=$removed_roots" >> "$GITHUB_ENV"
@@ -507,34 +569,6 @@ jobs:
           echo "publish_sha=$publish_commit" >> "$GITHUB_OUTPUT"
           echo "Created publish commit: $publish_commit"
 
-      # PyPI publish runs BEFORE the target-branch push: a failed upload must
-      # block the release, because production plugin bundles pin
-      # cadgen==<version> from PyPI and a main without the matching PyPI
-      # release would break skill installs. If PyPI succeeds but the push
-      # fails, rerun Release with set_version pinned; skip-existing makes the
-      # re-upload a no-op.
-      - name: Check cadgen package version matches the canonical release version
-        if: ${{ steps.gate.outputs.should_publish == 'true' && inputs.target_branch == 'main' }}
-        run: |
-          version="$(tr -d '[:space:]' < VERSION)"
-          if ! grep -Eq "^version = \"$version\"$" packages/cadgen/pyproject.toml; then
-            echo "packages/cadgen/pyproject.toml version does not match VERSION ($version)." >&2
-            exit 1
-          fi
-
-      - name: Build cadgen sdist and wheel
-        if: ${{ steps.gate.outputs.should_publish == 'true' && inputs.target_branch == 'main' }}
-        run: |
-          python3 -m pip install --upgrade build
-          python3 -m build packages/cadgen
-
-      - name: Publish cadgen to PyPI
-        if: ${{ steps.gate.outputs.should_publish == 'true' && inputs.target_branch == 'main' }}
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          packages-dir: packages/cadgen/dist
-          skip-existing: true
-
       - name: Push target branch
         if: steps.gate.outputs.should_publish == 'true'
         id: push
@@ -548,13 +582,19 @@ jobs:
           fi
           echo "published=true" >> "$GITHUB_OUTPUT"
 
+  # Deploys from the release SOURCE commit, not the publish commit: the docs app
+  # builds against repo-root packages/, and the publish tree drops both. Still
+  # gated on the publish succeeding, so the site never moves for a release that
+  # did not ship.
   deploy-docs:
     name: Deploy Docs
-    needs: publish
+    needs:
+      - release-pr
+      - publish
     if: ${{ needs.publish.outputs.published == 'true' && inputs.target_branch == 'main' }}
     uses: ./.github/workflows/deploy-docs.yml
     with:
-      ref: ${{ needs.publish.outputs.publish_sha }}
+      ref: ${{ needs.release-pr.outputs.source_sha }}
     secrets: inherit
 
   # Mirrors from the release SOURCE commit, not the publish commit: the publish
