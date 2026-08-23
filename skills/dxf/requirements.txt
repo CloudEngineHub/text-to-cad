@@ -1,3 +1,3 @@
-cadgen==0.4.21
+cadgen==0.4.22
 ezdxf
 shapely
